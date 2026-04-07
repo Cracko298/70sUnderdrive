@@ -5,6 +5,7 @@ from xml.dom import minidom
 
 # This is the SaveGame decryption key for the XOR Cipher they used.
 KEY = b"PLEASE DO NOT HACK THIS FOR A WHILE. WE REALLY WANT TO EARN A BIT."
+REQUIRED_TAG = "m_isMPH"
 
 def xor_data(data: bytes, key: bytes) -> bytes:
     return bytes(b ^ key[i % len(key)] for i, b in enumerate(data))
@@ -18,23 +19,39 @@ def try_decode_xml(data: bytes) -> str:
                 return text
         except UnicodeDecodeError:
             pass
-    raise ValueError("Could not decode decrypted data as XML text.")
+    raise ValueError("Could not decode data as XML text.")
 
 def pretty_xml(element: ET.Element) -> str:
     rough_string = ET.tostring(element, encoding="utf-8")
     reparsed = minidom.parseString(rough_string)
     return reparsed.toprettyxml(indent="    ")
 
+def validate_80s_overdrive_save(xml_text: str) -> ET.Element:
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError as e:
+        raise ValueError(f"XML parse failed: {e}") from e
+
+    if REQUIRED_TAG not in xml_text:
+        raise ValueError(
+            f"This SaveGame does not appear to be a valid 80s Overdrive Save. "
+            f"Required tag '{REQUIRED_TAG}' was not found."
+        )
+
+    return root
+
 class XmlSaveEditor:
     def __init__(self, root):
         self.root = root
-        self.root.title("80s Overdrive Save Editor")
+        self.root.title("70s Undervolt - An 80s Overdrive Save Editor")
         self.root.geometry("1100x700")
         self.root.minsize(980, 620)
 
         self.file_path = None
         self.tree_root = None
         self.item_to_element = {}
+        self.use_xor_on_save = True
+        self.loaded_format_name = None
 
         self.colors = {
             "bg_top": "#14001f",
@@ -186,7 +203,7 @@ class XmlSaveEditor:
 
         self.path_label = self.style_label(
             self.top_bar,
-            text="No file loaded",
+            text="[No SaveGame Loaded]",
             anchor="w",
             bg=self.colors["panel_2"],
             fg=self.colors["text"],
@@ -207,7 +224,7 @@ class XmlSaveEditor:
         left_frame = self.style_frame(self.main_pane)
         self.main_pane.add(left_frame, width=450)
 
-        tree_header = self.style_label(left_frame, text="XML TREE", fg=self.colors["gold"], font=("Consolas", 11, "bold"))
+        tree_header = self.style_label(left_frame, text="XML Tree", fg=self.colors["gold"], font=("Consolas", 11, "bold"))
         tree_header.pack(anchor="w", padx=8, pady=(8, 2))
 
         tree_container = tk.Frame(left_frame, bg=self.colors["panel"])
@@ -362,9 +379,39 @@ class XmlSaveEditor:
         self.canvas.tag_lower("bg")
         self.canvas.tag_raise(self.canvas_window)
 
+    def try_load_save_variants(self, raw_data: bytes):
+        attempts = [
+            ("PC/Steam", True, xor_data(raw_data, KEY)),
+            ("Nintendo Switch", False, raw_data),
+        ]
+
+        errors = []
+        not_80s_error = None
+
+        for label, use_xor, candidate_data in attempts:
+            try:
+                xml_text = try_decode_xml(candidate_data)
+                parsed_root = validate_80s_overdrive_save(xml_text)
+                return parsed_root, use_xor, label
+            except ValueError as e:
+                error_text = f"{label}: {e}"
+                errors.append(error_text)
+                if REQUIRED_TAG in str(e):
+                    not_80s_error = error_text
+            except Exception as e:
+                errors.append(f"{label}: {e}")
+
+        if not_80s_error is not None:
+            raise ValueError(not_80s_error)
+
+        raise ValueError(
+            "Failed to load save. Not a Valid 80s Overdrive SaveGame "
+            "Did not produce or load.\n\n" + "\n".join(errors)
+        )
+
     def open_file(self):
         path = filedialog.askopenfilename(
-            title="Open Encrypted Save",
+            title="Open Save",
             filetypes=[("Save files", "*.sav"), ("All files", "*.*")]
         )
         if not path:
@@ -372,18 +419,19 @@ class XmlSaveEditor:
 
         try:
             with open(path, "rb") as f:
-                encrypted = f.read()
+                raw_data = f.read()
 
-            decrypted = xor_data(encrypted, KEY)
-            xml_text = try_decode_xml(decrypted)
-
-            self.tree_root = ET.fromstring(xml_text)
+            self.tree_root, self.use_xor_on_save, self.loaded_format_name = self.try_load_save_variants(raw_data)
             self.file_path = path
-            self.path_label.config(text=path)
+            suffix = " [PC/Steam SaveGame]" if self.use_xor_on_save else " [Nintendo Switch SaveGame]"
+            self.path_label.config(text=path + suffix)
             self.reload_tree()
-            messagebox.showinfo("Success", "File decrypted and SaveGame loaded successfully.")
+            messagebox.showinfo(
+                "Success",
+                f"Loaded 80s Overdrive save successfully.\nDetected format: {self.loaded_format_name}."
+            )
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to open/decrypt/parse file:\n{e}")
+            messagebox.showerror("Error", f"Failed to open/validate/parse file:\n{e}")
 
     def reload_tree(self):
         self.xml_tree.delete(*self.xml_tree.get_children())
@@ -502,13 +550,21 @@ class XmlSaveEditor:
         else:
             messagebox.showwarning("Missing Attribute", f"Attribute '{name}' not found.")
 
-    def build_encrypted_output(self) -> bytes:
+    def build_output_bytes(self) -> bytes:
         if self.tree_root is None:
             raise ValueError("No SaveGame loaded.")
 
         xml_text = pretty_xml(self.tree_root)
+
+        if REQUIRED_TAG not in xml_text:
+            raise ValueError(
+                f"Refusing to save because required tag '{REQUIRED_TAG}' was not found."
+            )
+
         xml_bytes = xml_text.encode("utf-8")
-        return xor_data(xml_bytes, KEY)
+        if self.use_xor_on_save:
+            return xor_data(xml_bytes, KEY)
+        return xml_bytes
 
     def save_file(self):
         if self.file_path is None:
@@ -516,10 +572,11 @@ class XmlSaveEditor:
             return
 
         try:
-            encrypted = self.build_encrypted_output()
+            output_data = self.build_output_bytes()
             with open(self.file_path, "wb") as f:
-                f.write(encrypted)
-            messagebox.showinfo("Saved", f"Saved encrypted SaveGame back to:\n{self.file_path}")
+                f.write(output_data)
+            save_mode = "PC/Steam" if self.use_xor_on_save else "Nintendo Switch"
+            messagebox.showinfo("Saved", f"Saved {save_mode} SaveGame back to:\n{self.file_path}")
         except Exception as e:
             messagebox.showerror("Save Error", f"Failed to save SaveGame:\n{e}")
 
@@ -529,7 +586,7 @@ class XmlSaveEditor:
             return
 
         path = filedialog.asksaveasfilename(
-            title="Save Encrypted File As",
+            title="Save File As",
             defaultextension=".sav",
             filetypes=[("Save Files", "*.sav"), ("All files", "*.*")]
         )
@@ -537,16 +594,18 @@ class XmlSaveEditor:
             return
 
         try:
-            encrypted = self.build_encrypted_output()
+            output_data = self.build_output_bytes()
             with open(path, "wb") as f:
-                f.write(encrypted)
+                f.write(output_data)
             self.file_path = path
-            self.path_label.config(text=path)
-            messagebox.showinfo("Saved", f"Saved SaveGame to:\n{path}")
+            suffix = " [PC/Steam SaveGame]" if self.use_xor_on_save else " [Nintendo Switch SaveGame]"
+            self.path_label.config(text=path + suffix)
+            save_mode = "PC/Steam" if self.use_xor_on_save else "Nintendo Switch"
+            messagebox.showinfo("Saved", f"Saved {save_mode} SaveGame to:\n{path}")
         except Exception as e:
             messagebox.showerror("Save Error", f"Failed to save SaveGame:\n{e}")
 
-
+# Cracko298
 if __name__ == "__main__":
     root = tk.Tk()
     app = XmlSaveEditor(root)
